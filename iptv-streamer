@@ -1,0 +1,185 @@
+#!/bin/bash
+
+LOG_DIR="/var/log/iptv_channels"
+HISTORY_LOG="${LOG_DIR}/channels_history.log"
+MEDIA_DIR="/home/iptvstreamer/streams/uploads"
+
+ffmpeg_command(){
+	local NAME="$1"
+    local MC="$2"
+    local PORT="$3"
+    local BITRATE="$4"
+    local INPUT_FILE="$5"
+
+    local CHANNEL_NAME="${NAME// /_}"
+    local BUFFER=$(( BITRATE / 2 ))
+    local MUXBITRATE=$(( (BITRATE + 1000) * 1000 ))
+
+	ffmpeg -re -stream_loop -1 -i "$INPUT_FILE" \
+		-c:v libx264 -preset medium -profile:v main -level:v 4.0 -pix_fmt yuv420p \
+		-r 25 -g 50 -keyint_min 50 \
+		-b:v "${BITRATE}k" -minrate:v "${BITRATE}k" -maxrate:v "${BITRATE}k" \
+		-bufsize:v "${BUFFER}k" \
+		-x264-params "nal-hrd=cbr:force-cfr=1" \
+		-c:a aac -b:a 192k -ar 48000 -ac 2 \
+		-muxrate "${MUXBITRATE}" \
+		-mpegts_flags +initial_discontinuity+system_b \
+		-mpegts_transport_stream_id 100 -mpegts_original_network_id 1 -mpegts_service_id 100 \
+		-mpegts_pmt_start_pid 4096 -mpegts_start_pid 256 \
+		-pat_period 0.1 -sdt_period 0.5 -pcr_period 20 \
+		-metadata service_provider="Mtel" -metadata service_name="$NAME" \
+		-f mpegts "udp://${MC}:${PORT}?ttl=16&pkt_size=1316&bitrate=${MUXBITRATE}&fifo_size=1000000" \
+		> "${LOG_DIR}/${CHANNEL_NAME}.log" 2>&1 &
+	
+	local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+	echo "[$timestamp] [INFO] New channel created | Name: $NAME | Multicast: $MC:$PORT | Bitrate: ${BITRATE}k | Log: ${CHANNEL_NAME}.log" >> "$HISTORY_LOG"
+}
+
+select_video_file(){
+    local FILE_LIST=()
+    local i=1
+
+    shopt -s nullglob
+    for f in "$MEDIA_DIR"/*; do
+        FILE_LIST+=("$i" "$(basename "$f")")
+        ((i++))
+    done
+    shopt -u nullglob
+
+    if [ ${#FILE_LIST[@]} -eq 0 ]; then
+        dialog --msgbox "Error: No video files (.mp4, .mkv, .ts, .avi) found in:\n$MEDIA_DIR" 8 55
+        return 1
+    fi
+
+    local FILE_INDEX
+    FILE_INDEX=$(dialog --title "Select Video File" \
+                        --menu "Choose a file from $MEDIA_DIR:" 15 60 8 \
+                        "${FILE_LIST[@]}" \
+                        3>&1 1>&2 2>&3)
+
+    if [ $? -ne 0 ] || [ -z "$FILE_INDEX" ]; then
+        return 1
+    fi
+
+    SELECTED_FILE="${MEDIA_DIR}/${FILE_LIST[$(( (FILE_INDEX - 1) * 2 + 1 ))]}"
+    return 0
+}
+
+new_stream(){
+    select_video_file || return 0
+    local INPUT_FILE="$SELECTED_FILE"
+
+	PARAMS=$(dialog --form "Input the stream parameters:" \
+	13 45 4 \
+	"Name:"       1 1 "" 1 14 25 0 \
+    "Multicast:"  2 1 "" 2 14 25 0 \
+    "Port:"       3 1 "" 3 14 25 0 \
+    "Bitrate(k):" 4 1 "" 4 14 25 0 \
+	3>&1 1>&2 2>&3)
+
+	if [ $? -ne 0 ]; then
+		return 0
+	fi
+
+	NAME=$(echo "$PARAMS" | sed -n "1p")
+    MC=$(echo "$PARAMS" | sed -n "2p")
+    PORT=$(echo "$PARAMS" | sed -n "3p")
+    BITRATE=$(echo "$PARAMS" | sed -n "4p")
+
+	if [ -z "$NAME" ] || [ -z "$INPUT_FILE" ] || [ -z "$MC" ] || [ -z "$PORT" ] || [ -z "$BITRATE" ]; then
+        dialog --msgbox "Error: All fields are required!" 8 35
+        return 1
+    fi
+
+    if dialog --yesno "Do you want to create stream:\nName: $NAME\nudp://$MC:$PORT" 10 45; then
+        ffmpeg_command "$NAME" "$MC" "$PORT" "$BITRATE" "$INPUT_FILE"
+        dialog --msgbox "Stream '$NAME' successfully started!" 8 40
+    fi
+
+}
+
+active_streams(){
+	while true; do
+        local STREAMS_RAW
+        STREAMS_RAW=$(ps aux | grep "[f]fmpeg" | grep "udp://")
+
+        if [ -z "$STREAMS_RAW" ]; then
+            dialog --msgbox "There are currently no active IPTV streams." 8 45
+            return 0
+        fi
+
+        local MENU_OPTIONS=()
+
+        while IFS= read -r line; do
+            local PID
+            PID=$(echo "$line" | awk '{print $2}')
+            
+            local UDP_DEST
+            UDP_DEST=$(echo "$line" | grep -o "udp://[^ ']*" | sed -e 's|udp://||' -e 's|\?.*||')
+            
+
+	        local STREAM_NAME
+            STREAM_NAME=$(echo "$line" | grep -o 'service_name=[^ ]*' | cut -d'=' -f2 | tr -d '"')
+
+			if [ -z "$STREAM_NAME" ]; then
+                STREAM_NAME="Unknown Stream"
+            fi
+
+            if [ -n "$PID" ] && [ -n "$UDP_DEST" ]; then
+                MENU_OPTIONS+=("$PID" "$STREAM_NAME ($UDP_DEST)")
+            fi
+        done <<< "$STREAMS_RAW"
+
+        if [ ${#MENU_OPTIONS[@]} -eq 0 ]; then
+            dialog --msgbox "There are currently no active IPTV streams." 8 45
+            return 0
+        fi
+
+        SELECTED_PID=$(dialog --title "Active IPTV Streams" \
+                              --menu "Select a stream to STOP (or Cancel to exit):" \
+                              15 65 6 \
+                              "${MENU_OPTIONS[@]}" \
+                              3>&1 1>&2 2>&3)
+
+        if [ $? -ne 0 ] || [ -z "$SELECTED_PID" ]; then
+            return 0
+        fi
+
+        if dialog --yesno "Are you sure you want to STOP stream with PID $SELECTED_PID?" 8 50; then
+            kill "$SELECTED_PID" 2>/dev/null
+            sleep 0.5
+            
+            if kill -0 "$SELECTED_PID" 2>/dev/null; then
+                kill -9 "$SELECTED_PID" 2>/dev/null
+            fi
+            
+            local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            echo "[$timestamp] [INFO] Stream stopped | PID: $SELECTED_PID" >> "$HISTORY_LOG"
+            
+            dialog --msgbox "Stream PID $SELECTED_PID stopped successfully." 8 45
+        fi
+    done
+}
+
+main_menu(){
+	while true; do
+		CHOICE=$(dialog --menu "Choose the option" \
+		12 45 25 \
+		1 "Create stream" 2 "Active streams" 3 "Exit" \
+		3>&1 1>&2 2>&3)
+
+		if [ $? -ne 0 ]; then
+			clear
+			return 0
+		fi
+
+		case $CHOICE in
+			1) new_stream ;;
+			2) active_streams ;;
+			3) clear; break ;;
+		esac
+	done
+}
+
+main_menu
+
